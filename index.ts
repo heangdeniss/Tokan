@@ -23,12 +23,18 @@ interface TokanConfig {
   minFileLines: number
   /** Do not report a diet unless it removes at least this many estimated tokens. */
   minSavedTokens: number
-  /** Context window size used by the HUD bar. */
+  /** Fallback context window size (tokens) used by the HUD. */
   contextWindow: number
   /** USD per 1,000,000 saved tokens. */
   pricePerMillion: number
+  /** Optional daily spend budget in USD (0 = none). */
+  dailyBudgetUsd: number
   /** Master switch. */
   enabled: boolean
+  /** Optional path substrings/globs to include (when non-empty). */
+  include: string[]
+  /** Optional path substrings/globs to exclude. */
+  exclude: string[]
   /** Optional overrides for grammar WASM specifiers or paths. */
   wasmPaths: Readonly<Record<string, string>>
 }
@@ -39,7 +45,10 @@ const DEFAULT_CONFIG: TokanConfig = {
   minSavedTokens: 100,
   contextWindow: 200_000,
   pricePerMillion: 15,
+  dailyBudgetUsd: 0,
   enabled: true,
+  include: [],
+  exclude: [],
   wasmPaths: {},
 }
 
@@ -49,10 +58,14 @@ function readConfig(options: unknown): TokanConfig {
     const value = Number(raw[key])
     return Number.isFinite(value) && value >= minimum ? value : fallback
   }
+  const strings = (key: string): string[] =>
+    Array.isArray(raw[key]) ? (raw[key] as unknown[]).filter((v): v is string => typeof v === "string" && v.length > 0) : []
   const wasmPaths =
     typeof raw.wasmPaths === "object" && raw.wasmPaths !== null
       ? (raw.wasmPaths as Record<string, string>)
       : {}
+  const dailyBudgetRaw = Number(raw.dailyBudgetUsd ?? raw.dailyBudget)
+  const dailyBudgetUsd = Number.isFinite(dailyBudgetRaw) && dailyBudgetRaw >= 0 ? dailyBudgetRaw : 0
 
   return {
     minFileBytes: number("minFileBytes", DEFAULT_CONFIG.minFileBytes, 1),
@@ -60,7 +73,10 @@ function readConfig(options: unknown): TokanConfig {
     minSavedTokens: number("minSavedTokens", DEFAULT_CONFIG.minSavedTokens, 1),
     contextWindow: number("contextWindow", DEFAULT_CONFIG.contextWindow, 1),
     pricePerMillion: number("pricePerMillion", DEFAULT_CONFIG.pricePerMillion, 0),
+    dailyBudgetUsd,
     enabled: raw.enabled !== false,
+    include: strings("include"),
+    exclude: strings("exclude"),
     wasmPaths,
   }
 }
@@ -74,46 +90,104 @@ const debug = (...message: unknown[]): void => {
 /* -------------------------------------------------------------------------- */
 
 interface State {
-  tokensUsed: number
+  enabled: boolean
+  hookCalls: number
   tokensSaved: number
   filesOptimized: number
-  messagesTracked: number
   readsSeen: number
   readsSkipped: number
   lastSavedTokens: number
+  skipReasons: Record<string, number>
+  recent: { file?: string; reason?: string; saved?: number; at: number }[]
   lastFilePath?: string
   lastSkipReason?: string
+  lastHookAt?: number
 }
 
-const emptyState = (): State => ({
-  tokensUsed: 0,
+const emptyState = (enabled = true): State => ({
+  enabled,
+  hookCalls: 0,
   tokensSaved: 0,
   filesOptimized: 0,
-  messagesTracked: 0,
   readsSeen: 0,
   readsSkipped: 0,
   lastSavedTokens: 0,
+  skipReasons: {},
+  recent: [],
 })
 
-function coerceState(value: unknown): State {
-  if (typeof value !== "object" || value === null) return emptyState()
+function coerceState(value: unknown, fallbackEnabled: boolean): State {
+  if (typeof value !== "object" || value === null) return emptyState(fallbackEnabled)
   const raw = value as Record<string, unknown>
   const finite = (key: string): number => {
     const candidate = Number(raw[key])
     return Number.isFinite(candidate) && candidate >= 0 ? candidate : 0
   }
+  const skipReasons: Record<string, number> = {}
+  if (typeof raw.skipReasons === "object" && raw.skipReasons !== null) {
+    for (const [k, v] of Object.entries(raw.skipReasons as Record<string, unknown>)) {
+      const n = Number(v)
+      if (k && Number.isFinite(n) && n >= 0) skipReasons[k] = Math.floor(n)
+    }
+  }
+  const recent: State["recent"] = []
+  if (Array.isArray(raw.recent)) {
+    for (const item of raw.recent.slice(0, 5)) {
+      if (typeof item !== "object" || item === null) continue
+      const r = item as Record<string, unknown>
+      const at = Number(r.at)
+      if (!Number.isFinite(at)) continue
+      const entry: State["recent"][number] = { at }
+      if (typeof r.file === "string") entry.file = r.file
+      if (typeof r.reason === "string") entry.reason = r.reason
+      if (Number.isFinite(Number(r.saved))) entry.saved = Number(r.saved)
+      recent.push(entry)
+    }
+  }
   const state: State = {
-    tokensUsed: finite("tokensUsed"),
+    enabled: typeof raw.enabled === "boolean" ? raw.enabled : fallbackEnabled,
+    hookCalls: Math.floor(finite("hookCalls")),
     tokensSaved: finite("tokensSaved"),
     filesOptimized: Math.floor(finite("filesOptimized")),
-    messagesTracked: Math.floor(finite("messagesTracked")),
     readsSeen: Math.floor(finite("readsSeen")),
     readsSkipped: Math.floor(finite("readsSkipped")),
     lastSavedTokens: finite("lastSavedTokens"),
+    skipReasons,
+    recent,
   }
   if (typeof raw.lastFilePath === "string") state.lastFilePath = raw.lastFilePath
   if (typeof raw.lastSkipReason === "string") state.lastSkipReason = raw.lastSkipReason
+  if (Number.isFinite(Number(raw.lastHookAt))) state.lastHookAt = Number(raw.lastHookAt)
   return state
+}
+
+function reasonKey(reason: string): string {
+  if (reason === "disabled" || reason === "partial read" || reason === "unreadable") {
+    return reason === "partial read" ? "partial" : reason
+  }
+  if (reason.startsWith("small")) return "small"
+  if (reason.startsWith("short")) return "short"
+  if (reason.startsWith("low gain")) return "low"
+  return "other"
+}
+
+function noteSkip(draft: State, reason: string, filePath?: string): void {
+  draft.readsSeen += 1
+  draft.readsSkipped += 1
+  draft.lastSkipReason = reason
+  if (filePath) draft.lastFilePath = path.basename(filePath)
+  const key = reasonKey(reason)
+  draft.skipReasons[key] = (draft.skipReasons[key] ?? 0) + 1
+  draft.recent = [{ file: draft.lastFilePath, reason, at: Date.now() }, ...draft.recent].slice(0, 5)
+}
+
+function noteDiet(draft: State, prepared: { filePath: string; savedTokens: number }): void {
+  draft.filesOptimized += 1
+  draft.tokensSaved += prepared.savedTokens
+  draft.lastSavedTokens = prepared.savedTokens
+  draft.lastFilePath = path.basename(prepared.filePath)
+  delete draft.lastSkipReason
+  draft.recent = [{ file: draft.lastFilePath, saved: prepared.savedTokens, at: Date.now() }, ...draft.recent].slice(0, 5)
 }
 
 const round = (value: number, digits = 2): number => {
@@ -135,37 +209,35 @@ class TokanState {
   constructor(
     initial: State,
     private readonly config: TokanConfig,
+    private readonly hooksReady = true,
     private readonly persist?: (snapshot: TokanStats) => void,
   ) {
     this.state = initial
   }
 
   snapshot(): TokanStats {
-    const {
-      tokensUsed,
-      tokensSaved,
-      filesOptimized,
-      messagesTracked,
-      readsSeen,
-      readsSkipped,
-      lastSavedTokens,
-      lastFilePath,
-      lastSkipReason,
-    } = this.state
+    const s = this.state
     const snapshot: TokanStats = {
-      tokensUsed: Math.round(tokensUsed),
-      tokensSaved: Math.round(tokensSaved),
-      filesOptimized,
-      messagesTracked,
-      readsSeen,
-      readsSkipped,
-      lastSavedTokens: Math.round(lastSavedTokens),
+      enabled: s.enabled,
+      hooksReady: this.hooksReady,
+      hookCalls: s.hookCalls,
+      tokensSaved: Math.round(s.tokensSaved),
+      filesOptimized: s.filesOptimized,
+      readsSeen: s.readsSeen,
+      readsSkipped: s.readsSkipped,
+      lastSavedTokens: Math.round(s.lastSavedTokens),
+      skipReasons: { ...s.skipReasons },
+      recent: s.recent.map((r) => ({ ...r })),
+      minFileBytes: this.config.minFileBytes,
+      minFileLines: this.config.minFileLines,
+      minSavedTokens: this.config.minSavedTokens,
       contextWindow: this.config.contextWindow,
-      contextUsed: Math.min(1, tokensUsed / this.config.contextWindow),
       pricePerMillion: this.config.pricePerMillion,
-      costSaved: round((tokensSaved / 1_000_000) * this.config.pricePerMillion),
-      ...(lastFilePath ? { lastFilePath } : {}),
-      ...(lastSkipReason ? { lastSkipReason } : {}),
+      dailyBudgetUsd: this.config.dailyBudgetUsd,
+      costSaved: round((s.tokensSaved / 1_000_000) * this.config.pricePerMillion),
+      ...(s.lastFilePath ? { lastFilePath: s.lastFilePath } : {}),
+      ...(s.lastSkipReason ? { lastSkipReason: s.lastSkipReason } : {}),
+      ...(typeof s.lastHookAt === "number" ? { lastHookAt: s.lastHookAt } : {}),
     }
     return snapshot
   }
@@ -189,8 +261,19 @@ class TokanState {
   }
 
   reset(): TokanStats {
-    this.state = emptyState()
+    const enabled = this.state.enabled
+    this.state = emptyState(enabled)
     return this.mutate(() => {})
+  }
+
+  toggle(): TokanStats {
+    return this.mutate((draft) => {
+      draft.enabled = !draft.enabled
+    })
+  }
+
+  active(): boolean {
+    return this.state.enabled
   }
 
   onChange(listener: (snapshot: TokanStats) => void): () => void {
@@ -210,6 +293,8 @@ let runtimeInit: Promise<void> | undefined
 const GRAMMARS: Readonly<Record<string, string>> = {
   ".ts": "tree-sitter-typescript/tree-sitter-typescript.wasm",
   ".tsx": "tree-sitter-typescript/tree-sitter-tsx.wasm",
+  ".mts": "tree-sitter-typescript/tree-sitter-typescript.wasm",
+  ".cts": "tree-sitter-typescript/tree-sitter-typescript.wasm",
   ".js": "tree-sitter-javascript/tree-sitter-javascript.wasm",
   ".jsx": "tree-sitter-javascript/tree-sitter-javascript.wasm",
   ".mjs": "tree-sitter-javascript/tree-sitter-javascript.wasm",
@@ -482,8 +567,22 @@ function resolveReadPath(root: string, requested: string): string | undefined {
   return resolved
 }
 
+function matchPattern(filePath: string, pattern: string): boolean {
+  const p = filePath.split(path.sep).join("/")
+  const n = pattern.split(path.sep).join("/")
+  if (!n) return false
+  if (n.includes("*")) {
+    const esc = n.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*\*/g, ".*").replace(/\*/g, "[^/]*")
+    try {
+      return new RegExp(esc).test(p)
+    } catch {
+      return p.includes(n.replace(/\*/g, ""))
+    }
+  }
+  return p.includes(n)
+}
+
 function isDietCandidate(filePath: string, config: TokanConfig): boolean {
-  if (!config.enabled) return false
   const extension = path.extname(filePath).toLowerCase()
   if (!(extension in GRAMMARS) && !(extension in config.wasmPaths)) return false
 
@@ -497,6 +596,8 @@ function isDietCandidate(filePath: string, config: TokanConfig): boolean {
   ) {
     return false
   }
+  if (config.include.length > 0 && !config.include.some((pat) => matchPattern(filePath, pat))) return false
+  if (config.exclude.length > 0 && config.exclude.some((pat) => matchPattern(filePath, pat))) return false
   return true
 }
 
@@ -534,8 +635,9 @@ interface ReadArgs {
 function readArgs(input: unknown): ReadArgs | undefined {
   if (typeof input !== "object" || input === null) return undefined
   const raw = input as Record<string, unknown>
+  const filePath = raw.filePath ?? raw.path ?? raw.file_path ?? raw.file
   return {
-    filePath: typeof raw.filePath === "string" ? raw.filePath : undefined,
+    filePath: typeof filePath === "string" ? filePath : undefined,
     offset: typeof raw.offset === "number" ? raw.offset : undefined,
     limit: typeof raw.limit === "number" ? raw.limit : undefined,
   }
@@ -561,18 +663,6 @@ function replaceResultContent(result: unknown, content: string): void {
   mutable.content = content
 }
 
-function messageText(parts: unknown): string {
-  if (!Array.isArray(parts)) return ""
-  let text = ""
-  for (const part of parts) {
-    if (typeof part === "object" && part !== null) {
-      const candidate = part as { type?: string; text?: string }
-      if (candidate.type === "text" && typeof candidate.text === "string") text += candidate.text
-    }
-  }
-  return text
-}
-
 /* -------------------------------------------------------------------------- */
 /* V2 plugin                                                                  */
 /* -------------------------------------------------------------------------- */
@@ -582,13 +672,14 @@ const serverPlugin = Plugin.define({
   async setup(ctx) {
     const config = readConfig(ctx.options)
     const stored = await ctx.storage.get("stats").catch(() => undefined)
-    const state = new TokanState(coerceState(stored), config, (snapshot) => {
+    const state = new TokanState(coerceState(stored, config.enabled), config, true, (snapshot) => {
       void ctx.storage.set("stats", snapshot).catch(() => {})
     })
 
     const registration = await ctx.rpc.register(Tokan, {
       stats: async () => state.snapshot(),
       reset: async () => state.reset(),
+      toggle: async () => state.toggle(),
     })
 
     const unsubscribeState = state.onChange((snapshot) => {
@@ -603,16 +694,27 @@ const serverPlugin = Plugin.define({
     await ctx.tool.hook("execute.before", async (event) => {
       if (event.tool !== "read") return
       try {
+        // Record hook activity so diagnostics can tell "hooks fire" vs "server off".
+        state.mutate((draft) => {
+          draft.hookCalls += 1
+          draft.lastHookAt = Date.now()
+        })
+
         const args = readArgs(event.input)
         if (!args?.filePath) return
         const filePath = resolveReadPath(ctx.location.directory, args.filePath)
         if (!filePath || !isDietCandidate(filePath, config)) return
 
+        if (!state.active()) {
+          state.mutate((draft) => {
+            noteSkip(draft, "disabled", filePath)
+          })
+          return
+        }
+
         if (args.offset !== undefined || args.limit !== undefined) {
           state.mutate((draft) => {
-            draft.readsSeen += 1
-            draft.readsSkipped += 1
-            draft.lastSkipReason = "partial read"
+            noteSkip(draft, "partial read", filePath)
           })
           return
         }
@@ -620,9 +722,7 @@ const serverPlugin = Plugin.define({
         const outcome = await prepareDiet(filePath, config)
         if (dietSkip(outcome)) {
           state.mutate((draft) => {
-            draft.readsSeen += 1
-            draft.readsSkipped += 1
-            draft.lastSkipReason = outcome.skip
+            noteSkip(draft, outcome.skip, filePath)
           })
           return
         }
@@ -645,28 +745,10 @@ const serverPlugin = Plugin.define({
       try {
         replaceResultContent(event.result, prepared.content)
         state.mutate((draft) => {
-          draft.filesOptimized += 1
-          draft.tokensSaved += prepared.savedTokens
-          draft.lastSavedTokens = prepared.savedTokens
-          draft.lastFilePath = path.basename(prepared.filePath)
-          delete draft.lastSkipReason
+          noteDiet(draft, prepared)
         })
       } catch (error) {
         debug("failed to apply AST diet", error)
-      }
-    })
-
-    // V1 name: chat.message. V2 equivalent: ctx.session.hook("prompt").
-    await ctx.session.hook("prompt", (event) => {
-      try {
-        const text = messageText([{ type: "text", text: (event.prompt as { text?: string }).text ?? "" }])
-        if (!text) return
-        state.mutate((draft) => {
-          draft.messagesTracked += 1
-          draft.tokensUsed += estimateTokens(text)
-        })
-      } catch (error) {
-        debug("message tracking failed", error)
       }
     })
 
@@ -684,35 +766,44 @@ const serverPlugin = Plugin.define({
 /**
  * OpenCode V1 loads the `server` member of a default export. V2 ignores it.
  * This keeps `opencode-tokan` usable on both major versions while the V2 API
- * above remains the primary implementation.
+ * above remains the primary implementation. V1 compat has no RPC bridge to the
+ * V2 TUI HUD; diet still applies to reads.
  */
 const server: V1Plugin = async (input, options) => {
   const config = readConfig(options)
-  const state = new TokanState(emptyState(), config)
+  const state = new TokanState(emptyState(config.enabled), config, false)
   const pending = new Map<string, PreparedDiet>()
 
   const hooks: V1Hooks = {
     "tool.execute.before": async (call, output) => {
       if (call.tool !== "read") return
       try {
+        state.mutate((draft) => {
+          draft.hookCalls += 1
+          draft.lastHookAt = Date.now()
+        })
+
         const args = readArgs(output.args)
         if (!args?.filePath) return
         const filePath = resolveReadPath(input.directory, args.filePath)
         if (!filePath || !isDietCandidate(filePath, config)) return
+
+        if (!state.active()) {
+          state.mutate((draft) => {
+            noteSkip(draft, "disabled", filePath)
+          })
+          return
+        }
         if (args.offset !== undefined || args.limit !== undefined) {
           state.mutate((draft) => {
-            draft.readsSeen += 1
-            draft.readsSkipped += 1
-            draft.lastSkipReason = "partial read"
+            noteSkip(draft, "partial read", filePath)
           })
           return
         }
         const outcome = await prepareDiet(filePath, config)
         if (dietSkip(outcome)) {
           state.mutate((draft) => {
-            draft.readsSeen += 1
-            draft.readsSkipped += 1
-            draft.lastSkipReason = outcome.skip
+            noteSkip(draft, outcome.skip, filePath)
           })
           return
         }
@@ -735,27 +826,10 @@ const server: V1Plugin = async (input, options) => {
         output.output = prepared.content
         output.title = "Tokan AST diet"
         state.mutate((draft) => {
-          draft.filesOptimized += 1
-          draft.tokensSaved += prepared.savedTokens
-          draft.lastSavedTokens = prepared.savedTokens
-          draft.lastFilePath = path.basename(prepared.filePath)
-          delete draft.lastSkipReason
+          noteDiet(draft, prepared)
         })
       } catch (error) {
         debug("v1 diet application failed", error)
-      }
-    },
-
-    "chat.message": async (_call, output) => {
-      try {
-        const text = messageText(output.parts)
-        if (!text) return
-        state.mutate((draft) => {
-          draft.messagesTracked += 1
-          draft.tokensUsed += estimateTokens(text)
-        })
-      } catch (error) {
-        debug("v1 message tracking failed", error)
       }
     },
 

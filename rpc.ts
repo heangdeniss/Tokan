@@ -2,37 +2,53 @@ import { Rpc } from "@opencode/plugin/rpc"
 import { z } from "zod"
 
 /**
- * Shared, typed contract between the server part (`index.ts`) and the TUI part
- * (`tui.tsx`). This module is intentionally side-effect free apart from
- * defining the RPC so it is safe to import from either runtime.
+ * Shared contract between the server part (`index.ts`) and the TUI part
+ * (`tui.tsx`). Side-effect free apart from defining the RPC.
  */
 export const statsSchema = z.object({
-  /** Estimated non-tool message tokens observed this session. */
-  tokensUsed: z.number().nonnegative(),
-  /** Estimated tokens removed from AST diet file reads. */
+  /** Whether the AST diet is active. */
+  enabled: z.boolean(),
+  /** Server hooks registered and stats RPC reachable. */
+  hooksReady: z.boolean(),
+  /** Read-tool hook invocations observed (dietable or not). */
+  hookCalls: z.number().int().nonnegative(),
+  /** Estimated tokens removed from AST-dieted reads. */
   tokensSaved: z.number().nonnegative(),
-  /** Number of file reads that went through the AST diet. */
+  /** Reads that were AST-dieted. */
   filesOptimized: z.number().int().nonnegative(),
-  /** Number of user messages observed. */
-  messagesTracked: z.number().int().nonnegative(),
-  /** Dietable read calls inspected. */
+  /** Diet-candidate reads inspected (qualified for size/path checks). */
   readsSeen: z.number().int().nonnegative(),
-  /** Dietable reads skipped (partial/small/short/low gain). */
+  /** Diet-candidate reads skipped (partial/small/short/low gain/unreadable). */
   readsSkipped: z.number().int().nonnegative(),
   /** Tokens saved by the most recent diet. */
   lastSavedTokens: z.number().nonnegative(),
-  /** Why the last dietable read was skipped, if any. */
+  /** Skip counts by reason key. */
+  skipReasons: z.record(z.string(), z.number().int().nonnegative()),
+  /** Recent diet outcomes (newest first). */
+  recent: z.array(z.object({
+    file: z.string().optional(),
+    reason: z.string().optional(),
+    saved: z.number().nonnegative().optional(),
+    at: z.number(),
+  })),
+  /** Why the last diet-candidate read was skipped, if any. */
   lastSkipReason: z.string().optional(),
-  /** Model context window used by the HUD's context bar. */
-  contextWindow: z.number().positive(),
-  /** Context window utilization, clamped to [0, 1]. */
-  contextUsed: z.number().min(0).max(1),
-  /** Configured USD price per million tokens. */
-  pricePerMillion: z.number().nonnegative(),
-  /** tokensSaved / 1_000_000 * pricePerMillion. */
-  costSaved: z.number().nonnegative(),
   /** Most recently dieted file, if any. */
   lastFilePath: z.string().optional(),
+  /** Epoch ms of last read-hook activity, if any. */
+  lastHookAt: z.number().optional(),
+  /** Effective diet thresholds. */
+  minFileBytes: z.number().positive(),
+  minFileLines: z.number().positive(),
+  minSavedTokens: z.number().positive(),
+  /** Configured fallback context window (tokens). */
+  contextWindow: z.number().positive(),
+  /** Configured USD price per million saved tokens. */
+  pricePerMillion: z.number().nonnegative(),
+  /** Optional daily spend budget in USD (0 = none). */
+  dailyBudgetUsd: z.number().nonnegative(),
+  /** tokensSaved / 1_000_000 * pricePerMillion. */
+  costSaved: z.number().nonnegative(),
 })
 
 export type TokanStats = z.infer<typeof statsSchema>
@@ -45,6 +61,10 @@ export const Tokan = Rpc.define({
       output: statsSchema,
     },
     reset: {
+      input: z.object({}),
+      output: statsSchema,
+    },
+    toggle: {
       input: z.object({}),
       output: statsSchema,
     },
