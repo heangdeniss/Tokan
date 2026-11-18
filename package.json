@@ -1,0 +1,67 @@
+{
+  "name": "opencode-tokan",
+  "version": "1.0.0",
+  "description": "OpenCode plugin with a live token-savings HUD and AST-based file-read diet.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "tokens",
+    "tree-sitter",
+    "tui"
+  ],
+  "exports": {
+    ".": "./index.ts",
+    "./tui": "./tui.tsx",
+    "./rpc": "./rpc.ts"
+  },
+  "files": [
+    "index.ts",
+    "tui.tsx",
+    "rpc.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.19.6",
+    "@opencode/plugin": "^2.3.2",
+    "tree-sitter-go": "^0.25.0",
+    "tree-sitter-javascript": "^0.25.0",
+    "tree-sitter-python": "^0.25.0",
+    "tree-sitter-rust": "^0.24.0",
+    "tree-sitter-typescript": "^0.23.2",
+    "web-tree-sitter": "^0.25.10",
+    "zod": "^4.1.8"
+  },
+  "peerDependencies": {
+    "@opentui/core": ">=0.8.4",
+    "@opentui/solid": ">=0.8.4",
+    "solid-js": ">=1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/core": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@opencode/theme": "^2.3.2",
+    "@opentui/core": "^0.8.4",
+    "@opentui/solid": "^0.8.4",
+    "@types/emscripten": "^1.40.4",
+    "@types/node": "^24.0.0",
+    "solid-js": "^1.9.17",
+    "typescript": "^5.9.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
