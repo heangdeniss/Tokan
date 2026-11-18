@@ -78,7 +78,11 @@ interface State {
   tokensSaved: number
   filesOptimized: number
   messagesTracked: number
+  readsSeen: number
+  readsSkipped: number
+  lastSavedTokens: number
   lastFilePath?: string
+  lastSkipReason?: string
 }
 
 const emptyState = (): State => ({
@@ -86,6 +90,9 @@ const emptyState = (): State => ({
   tokensSaved: 0,
   filesOptimized: 0,
   messagesTracked: 0,
+  readsSeen: 0,
+  readsSkipped: 0,
+  lastSavedTokens: 0,
 })
 
 function coerceState(value: unknown): State {
@@ -100,8 +107,12 @@ function coerceState(value: unknown): State {
     tokensSaved: finite("tokensSaved"),
     filesOptimized: Math.floor(finite("filesOptimized")),
     messagesTracked: Math.floor(finite("messagesTracked")),
+    readsSeen: Math.floor(finite("readsSeen")),
+    readsSkipped: Math.floor(finite("readsSkipped")),
+    lastSavedTokens: finite("lastSavedTokens"),
   }
   if (typeof raw.lastFilePath === "string") state.lastFilePath = raw.lastFilePath
+  if (typeof raw.lastSkipReason === "string") state.lastSkipReason = raw.lastSkipReason
   return state
 }
 
@@ -130,17 +141,31 @@ class TokanState {
   }
 
   snapshot(): TokanStats {
-    const { tokensUsed, tokensSaved, filesOptimized, messagesTracked, lastFilePath } = this.state
+    const {
+      tokensUsed,
+      tokensSaved,
+      filesOptimized,
+      messagesTracked,
+      readsSeen,
+      readsSkipped,
+      lastSavedTokens,
+      lastFilePath,
+      lastSkipReason,
+    } = this.state
     const snapshot: TokanStats = {
       tokensUsed: Math.round(tokensUsed),
       tokensSaved: Math.round(tokensSaved),
       filesOptimized,
       messagesTracked,
+      readsSeen,
+      readsSkipped,
+      lastSavedTokens: Math.round(lastSavedTokens),
       contextWindow: this.config.contextWindow,
       contextUsed: Math.min(1, tokensUsed / this.config.contextWindow),
       pricePerMillion: this.config.pricePerMillion,
       costSaved: round((tokensSaved / 1_000_000) * this.config.pricePerMillion),
       ...(lastFilePath ? { lastFilePath } : {}),
+      ...(lastSkipReason ? { lastSkipReason } : {}),
     }
     return snapshot
   }
@@ -442,6 +467,12 @@ interface PreparedDiet {
   savedTokens: number
 }
 
+type DietOutcome = PreparedDiet | { skip: string }
+
+function dietSkip(value: DietOutcome): value is { skip: string } {
+  return "skip" in value
+}
+
 function resolveReadPath(root: string, requested: string): string | undefined {
   const resolved = path.isAbsolute(requested)
     ? path.normalize(requested)
@@ -469,10 +500,15 @@ function isDietCandidate(filePath: string, config: TokanConfig): boolean {
   return true
 }
 
-async function prepareDiet(filePath: string, config: TokanConfig): Promise<PreparedDiet | null> {
-  const source = await readFile(filePath, "utf8")
-  if (Buffer.byteLength(source, "utf8") < config.minFileBytes) return null
-  if (source.split("\n").length < config.minFileLines) return null
+async function prepareDiet(filePath: string, config: TokanConfig): Promise<DietOutcome> {
+  let source: string
+  try {
+    source = await readFile(filePath, "utf8")
+  } catch {
+    return { skip: "unreadable" }
+  }
+  if (Buffer.byteLength(source, "utf8") < config.minFileBytes) return { skip: `small <${config.minFileBytes}B` }
+  if (source.split("\n").length < config.minFileLines) return { skip: `short <${config.minFileLines}L` }
 
   let body: string
   try {
@@ -484,7 +520,7 @@ async function prepareDiet(filePath: string, config: TokanConfig): Promise<Prepa
 
   const content = `${DIET_HEADER}${body}`
   const savedTokens = estimateTokens(source) - estimateTokens(content)
-  if (savedTokens < config.minSavedTokens) return null
+  if (savedTokens < config.minSavedTokens) return { skip: `low gain <${config.minSavedTokens}tok` }
 
   return { filePath, content, savedTokens }
 }
@@ -568,12 +604,33 @@ const serverPlugin = Plugin.define({
       if (event.tool !== "read") return
       try {
         const args = readArgs(event.input)
-        if (!args?.filePath || args.offset !== undefined || args.limit !== undefined) return
+        if (!args?.filePath) return
         const filePath = resolveReadPath(ctx.location.directory, args.filePath)
         if (!filePath || !isDietCandidate(filePath, config)) return
 
-        const prepared = await prepareDiet(filePath, config)
-        if (prepared) pending.set(String(event.id), prepared)
+        if (args.offset !== undefined || args.limit !== undefined) {
+          state.mutate((draft) => {
+            draft.readsSeen += 1
+            draft.readsSkipped += 1
+            draft.lastSkipReason = "partial read"
+          })
+          return
+        }
+
+        const outcome = await prepareDiet(filePath, config)
+        if (dietSkip(outcome)) {
+          state.mutate((draft) => {
+            draft.readsSeen += 1
+            draft.readsSkipped += 1
+            draft.lastSkipReason = outcome.skip
+          })
+          return
+        }
+        pending.set(String(event.id), outcome)
+        state.mutate((draft) => {
+          draft.readsSeen += 1
+          delete draft.lastSkipReason
+        })
       } catch (error) {
         debug("read interception failed", error)
       }
@@ -590,7 +647,9 @@ const serverPlugin = Plugin.define({
         state.mutate((draft) => {
           draft.filesOptimized += 1
           draft.tokensSaved += prepared.savedTokens
+          draft.lastSavedTokens = prepared.savedTokens
           draft.lastFilePath = path.basename(prepared.filePath)
+          delete draft.lastSkipReason
         })
       } catch (error) {
         debug("failed to apply AST diet", error)
@@ -637,11 +696,31 @@ const server: V1Plugin = async (input, options) => {
       if (call.tool !== "read") return
       try {
         const args = readArgs(output.args)
-        if (!args?.filePath || args.offset !== undefined || args.limit !== undefined) return
+        if (!args?.filePath) return
         const filePath = resolveReadPath(input.directory, args.filePath)
         if (!filePath || !isDietCandidate(filePath, config)) return
-        const prepared = await prepareDiet(filePath, config)
-        if (prepared) pending.set(call.callID, prepared)
+        if (args.offset !== undefined || args.limit !== undefined) {
+          state.mutate((draft) => {
+            draft.readsSeen += 1
+            draft.readsSkipped += 1
+            draft.lastSkipReason = "partial read"
+          })
+          return
+        }
+        const outcome = await prepareDiet(filePath, config)
+        if (dietSkip(outcome)) {
+          state.mutate((draft) => {
+            draft.readsSeen += 1
+            draft.readsSkipped += 1
+            draft.lastSkipReason = outcome.skip
+          })
+          return
+        }
+        pending.set(call.callID, outcome)
+        state.mutate((draft) => {
+          draft.readsSeen += 1
+          delete draft.lastSkipReason
+        })
       } catch (error) {
         debug("v1 read interception failed", error)
       }
@@ -658,7 +737,9 @@ const server: V1Plugin = async (input, options) => {
         state.mutate((draft) => {
           draft.filesOptimized += 1
           draft.tokensSaved += prepared.savedTokens
+          draft.lastSavedTokens = prepared.savedTokens
           draft.lastFilePath = path.basename(prepared.filePath)
+          delete draft.lastSkipReason
         })
       } catch (error) {
         debug("v1 diet application failed", error)

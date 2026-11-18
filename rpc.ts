@@ -15,6 +15,14 @@ export const statsSchema = z.object({
   filesOptimized: z.number().int().nonnegative(),
   /** Number of user messages observed. */
   messagesTracked: z.number().int().nonnegative(),
+  /** Dietable read calls inspected. */
+  readsSeen: z.number().int().nonnegative(),
+  /** Dietable reads skipped (partial/small/short/low gain). */
+  readsSkipped: z.number().int().nonnegative(),
+  /** Tokens saved by the most recent diet. */
+  lastSavedTokens: z.number().nonnegative(),
+  /** Why the last dietable read was skipped, if any. */
+  lastSkipReason: z.string().optional(),
   /** Model context window used by the HUD's context bar. */
   contextWindow: z.number().positive(),
   /** Context window utilization, clamped to [0, 1]. */
